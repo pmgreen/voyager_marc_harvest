@@ -33,7 +33,6 @@ Since: 2013-03-01
 
 from xml.dom.minidom import parseString
 import difflib
-import filecmp
 import os
 import tarfile
 import tempfile
@@ -45,8 +44,6 @@ TMP_PREFIX = 'voy_harvest'
 NO_DIFFERENCE = 'NO_DIFFERENCE'
 MRX_NS = 'http://www.loc.gov/MARC21/slim'
 ET.register_namespace('', MRX_NS)
-
-
 
 class Record(object):
 	'''Internal representation of an Ex Libris OAI-PMH wrapped MaRCXML record.
@@ -104,40 +101,28 @@ class Record(object):
 		return ET.tostring(record_e, encoding='UTF-8')
 
 	def _make_diff(self, prev_xml_str, new_xml_str, prev_date, new_date):
-		pretty_new_fp = self._xml_str_to_tmp(new_xml_str)
-		pretty_prev_fp = self._xml_str_to_tmp(prev_xml_str)
 		diff = None
 		try:
-			if filecmp.cmp(pretty_new_fp, pretty_prev_fp):
+			if prev_xml_str == new_xml_str:
 				diff = NO_DIFFERENCE
 			else:
-				with open(pretty_new_fp, 'rU') as n:
-					nlines = n.readlines()
-					with open(pretty_prev_fp, 'rU') as p:
-						plines = p.readlines()
-						diff_gen = difflib.unified_diff(plines, nlines, 
-							fromfiledate=prev_date, tofiledate=new_date)
-						diff = ''.join(diff_gen)
+				prev_dom = parseString(prev_xml_str)
+				pretty_prev = prev_dom.toprettyxml(encoding='UTF-8', newl='\n')
+
+				new_dom = parseString(new_xml_str)
+				pretty_new = new_dom.toprettyxml(encoding='UTF-8', newl='\n')
+
+				diff_gen = difflib.unified_diff(pretty_prev.split('\n'), 
+												pretty_new.split('\n'), 
+												fromfiledate=prev_date, 
+												tofiledate=new_date)
+				diff = '\n'.join(diff_gen)
+		
 		except Exception, e:
 			raise e
 		finally:
-			if pretty_new_fp:
-				os.remove(pretty_new_fp)
-			if pretty_prev_fp:
-				os.remove(pretty_prev_fp)
 			return diff
 		
-	def _xml_str_to_tmp(self, xml_str):
-		'''Write a string of XML to a temporary file.
-
-		Returns:
-			(str) The path to the temporary file.
-		'''
-		pretty_xml = parseString(xml_str).toprettyxml(encoding='UTF-8')
-		tmp_fp = tempfile.mktemp(TMP_PREFIX)
-		with open(tmp_fp, 'wb') as f:
-			f.write(pretty_xml.encode('UTF-8'))
-		return tmp_fp
 
 
 def unpack_tarball(tarfile_fp):
@@ -174,8 +159,7 @@ def unpack_tarball(tarfile_fp):
 
 def process_tmp_dir(dp):
 	xml_fps = [os.path.join(dp, fn) for fn in os.listdir(dp)]
-	record_objs = [Record(xml_fp) for xml_fp in xml_fps]
-
+	# TODO
 
 if __name__ == '__main__':
 	import sys
