@@ -32,6 +32,7 @@ Since: 2013-03-01
 #
 
 from xml.dom.minidom import parseString
+import dateutil.parser
 import difflib
 import os
 import tarfile
@@ -91,7 +92,7 @@ class Record(object):
 		# may have to modify if EL ever gets ListRecords into the right NS
 		header = root.findall('./ListRecords/record/header')[0]
 		control_no = header.findall('identifier')[0].text
-		datestamp = header.findall('datestamp')[0].text #todo: make a datetime
+		datestamp = dateutil.parser.parse(header.findall('datestamp')[0].text)
 		return (control_no, datestamp)
 
 	def _extract_marcxml(self, oai_etree):
@@ -114,8 +115,8 @@ class Record(object):
 
 				diff_gen = difflib.unified_diff(pretty_prev.split('\n'), 
 												pretty_new.split('\n'), 
-												fromfiledate=prev_date, 
-												tofiledate=new_date)
+												fromfiledate=prev_date.isoformat(), 
+												tofiledate=new_date.isoformat())
 				diff = '\n'.join(diff_gen)
 		
 		except Exception, e:
