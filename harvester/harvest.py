@@ -36,22 +36,25 @@ import dateutil.parser
 import difflib
 import os
 import tarfile
-import tempfile
 import xml.etree.cElementTree as ET
 
 # TODO: logging.
 
-TMP_PREFIX = 'voy_harvest'
+# Configuration
+ERROR_DIR = '/tmp/voy_harvest_errs'
+TAR_DOWNLOADS = '/home/jstroop/voy_pull'
+
+# Constants
 NO_DIFFERENCE = 'NO_DIFFERENCE'
 MRX_NS = 'http://www.loc.gov/MARC21/slim'
 ET.register_namespace('', MRX_NS)
+TAR_EXTENSION = 'tar.gz'
 
 class Record(object):
-	'''Internal representation of an Ex Libris OAI-PMH wrapped MaRCXML record.
-	This contains the first version, the most recent version, and a list of
-	(datestamp, diff) two-ples for everything in between.
+	'''Internal representation of a MaRCXML record, without Ex Libris' OAI-PMH 
+	wrapper MaRCXML record. Contains the first version, the most recent 
+	version, and a list of (datetime, diff) two-ples for everything in between.
 	'''
-	# TODO __slots__ once the dust has settled.
 	def __init__(self, control_no=None, last_mod=None, diffs=[], 
 		first_version=None, current_version=None):
 		self.control_no = control_no
@@ -61,7 +64,7 @@ class Record(object):
 		self.current_version = current_version
 
 	def __unicode__(self):
-		return parseString(self.current_version).toprettyxml()
+		return parseString(self.current_version).toprettyxml(encoding='UTF-8')
 
 	def __str__(self):
 		return self.__unicode__()
@@ -69,12 +72,12 @@ class Record(object):
 	def add_version(self, xml_fp):
 		oai_etree = ET.parse(xml_fp)
 
-		control_no, new_last_mod = self._extract_header_vals(oai_etree)
+		control_no, new_last_mod = Record.extract_header_vals(xml_fp)
 
 		if self.control_no is None:
 		 	self.control_no = control_no 
 
-		new_mrx = self._extract_marcxml(oai_etree)
+		new_mrx = Record.extract_marcxml(xml_fp)
 
 		if self.first_version is None:
 			self.last_mod = new_last_mod
@@ -86,20 +89,36 @@ class Record(object):
 			self.diffs.append((self.last_mod, diff))
 			self.current_version = new_mrx
 
-	def _extract_header_vals(self, oai_etree):
-		'''Return a 2-ple (id, datestamp)'''
-		root = oai_etree.getroot()
-		# may have to modify if EL ever gets ListRecords into the right NS
-		header = root.findall('./ListRecords/record/header')[0]
-		control_no = header.findall('identifier')[0].text
-		datestamp = dateutil.parser.parse(header.findall('datestamp')[0].text)
-		return (control_no, datestamp)
+	# Don't love that this and the next meth both have to parse, but we need to 
+	# do these things extarnal to the class as well.
+	@staticmethod
+	def extract_header_vals(exlibris_marcxml_fp):
+		'''Return a 2-ple (id, datestamp).
+		'''
+		try:
+			etree = ET.parse(exlibris_marcxml_fp) 
+			root = etree.getroot()
+			header = root.findall('./ListRecords/record/header')[0]
+			control_no = header.findall('identifier')[0].text
+			datestamp = dateutil.parser.parse(header.findall('datestamp')[0].text)
+		except Exception as e:
+			raise HarvesterException(e, exlibris_marcxml_fp)
+		else:
+			return (control_no, datestamp)
 
-	def _extract_marcxml(self, oai_etree):
-		'''Get the MaRCXML as a str'''
-		root = oai_etree.getroot()
-		record_e = root.findall('.//metadata/*')[0]
-		return ET.tostring(record_e, encoding='UTF-8')
+	@staticmethod
+	def extract_marcxml(exlibris_marcxml_fp):
+		'''Get the MaRCXML as a str.
+		'''
+		try:
+			etree = ET.parse(exlibris_marcxml_fp) 
+			root = etree.getroot()
+			record_e = root.findall('.//metadata/*')[0]
+		except Exception, e:
+			raise HarvesterException(e, exlibris_marcxml_fp)
+		else:
+			return ET.tostring(record_e, encoding='UTF-8').split('?>')[-1].strip()
+			# There must be a better way to strip the PI, but this ^ is it for now.
 
 	def _make_diff(self, prev_xml_str, new_xml_str, prev_date, new_date):
 		diff = None
@@ -109,14 +128,16 @@ class Record(object):
 			else:
 				prev_dom = parseString(prev_xml_str)
 				pretty_prev = prev_dom.toprettyxml(encoding='UTF-8', newl='\n')
+				prev_date_iso = prev_date.isoformat()
 
 				new_dom = parseString(new_xml_str)
 				pretty_new = new_dom.toprettyxml(encoding='UTF-8', newl='\n')
+				new_date_iso = new_date.isoformat()
 
 				diff_gen = difflib.unified_diff(pretty_prev.split('\n'), 
 												pretty_new.split('\n'), 
-												fromfiledate=prev_date.isoformat(), 
-												tofiledate=new_date.isoformat())
+												fromfiledate=prev_date_iso,
+												tofiledate=new_date_iso)
 				diff = '\n'.join(diff_gen)
 		
 		except Exception, e:
@@ -124,62 +145,119 @@ class Record(object):
 		finally:
 			return diff
 		
-
-
 def unpack_tarball(tarfile_fp):
-	'''Unpack a tarball to a temporary directory.
-	
-	Args:
-		tarfile_fp (str): Path to the tarball.
-		to_dir (str): Where to unpack.
-
-	Returns:
-		(str) The path to the directory that was created.
+	'''Unpack a tarball to a temporary directory. Return (str) the path to the 
+	directory that was created.
 
 	Raises:
-		OSError, if the temporary directory can't be created.
 		Exception, in anything else goes wrong.
 	'''
-	to_dir = tempfile.mkdtemp(prefix=TMP_PREFIX)
+	# have to keep files nad dirs sorted by time (name) for later processing
+	fname = os.path.basename(tarfile_fp)[:-len(TAR_EXTENSION)-1]
+	to_dir = '/tmp/voy_harvest%s' % (fname,)
+	os.mkdir(to_dir)
 	try:
 		t = tarfile.open(tarfile_fp, 'r')
 		t.extractall(to_dir)
-		
-	except OSError as ose:
-		raise ose
 	except Exception as e:
 		if to_dir:
 			fps = [os.path.join(to_dir, p) for p in os.listdir(to_dir)]
 			map(os.remove, fps)
 			os.rmdir(to_dir)
-		raise e
+		raise HarvesterException(e, tarfile_fp)
+	else:
+		os.remove(tarfile_fp)
 	finally:
 		t.close()
 		if to_dir:
 			return to_dir
 
-def process_tmp_dir(dp):
+def process_tarball_dir(dp):
+	'''Return a list of paths to directories that contain the contents of 
+	unpacked tar files.
+	'''
+	tar_fns = [n for n in filter(lambda n: n.endswith(TAR_EXTENSION), os.listdir(dp))]
+	tar_fps = [os.path.join(TAR_DOWNLOADS, fn) for fn in tar_fns]
+	unpacked_dps = []
+	for tar_fp in tar_fps:
+		try:
+			dp = unpack_tarball(tar_fp)
+		except HarvesterException as he:
+			pass # init of HarvesterException handles.
+		except Exception as e:
+			raise HarvesterException(e, tar_fp)
+		else:
+			unpacked_dps.append(dp)
+	unpacked_dps.sort()
+	return unpacked_dps		
+
+def process_file_dir(dp):
 	xml_fps = [os.path.join(dp, fn) for fn in os.listdir(dp)]
-	# TODO
+	xml_fps.sort()
+	for xml_fp in xml_fps:
+		try:
+			control_no, stamp = Record.extract_header_vals(xml_fp)
+		except HarvesterException as he:
+			pass # init of HarvesterException handles.
+		except Exception as e:
+			raise HarvesterException(e, xml_fp)
+		else:
+			pass # print control_no
 
+class HarvesterException(Exception):
+	'''Raised when we have trouble with any kind of file: tar or XML. Whether
+	it's parsing or missing elements, this class will copy the file at the 
+	specified path (fp) to a holding location for further inspection.
+	'''
+	def __init__(self, original_exception, fp):
+		cl_name = original_exception.__class__.__name__
+		message = str(original_exception)
+		super(HarvesterException, self).__init__(str(original_exception))
+
+		import shutil
+		
+		if not os.path.exists(ERROR_DIR):
+			os.makedirs(ERROR_DIR)
+
+		# account for dupes
+		new_path = os.path.join(ERROR_DIR, os.path.basename(fp))
+		c = 0
+		while os.path.exists(new_path):
+			new_path = '%s-%d' % (new_path, c)
+			c+=1
+		shutil.move(fp, new_path)
+
+		#TODO: log
+		bn = os.path.basename(fp)
+		os.sys.stderr.write('%s: (%s) %s\n' % (cl_name, fp, message))
+		os.sys.stderr.write('Could not handle %s. Moved to %s.\n' % (bn, ERROR_DIR))
+
+		
 if __name__ == '__main__':
-	import sys
-	# try to unpack all tar files
-	try:
-		pass
-	# If something goes wrong, log the problem and move the tar file to a 
-	# holding space for later examination.
-	except Exception, e:
-		# TODO
-		raise
-	finally:
-		pass
 
-	# xml_dp = unpack_tarball('/home/jstroop/workspace/voy_pull/primo.20130228100648.0.tar.gz')
-	r = Record()
+	dps = process_tarball_dir(TAR_DOWNLOADS)
+	for dp in dps:
+		process_file_dir(dp)
 
-	r.add_version('/tmp/voy_harvest4paRlx/primo.export.130228100002.100180.0.xml')
+	# # xml_dp = unpack_tarball('/home/jstroop/workspace/voy_pull/primo.20130228100648.0.tar.gz')
+	# r = Record()
 	# r.add_version('/tmp/voy_harvest4paRlx/primo.export.130228100002.100180.0.xml')
-	r.add_version('/tmp/altered.xml')
-	print r.diffs[0][1]
-	# print r.control_no, r.last_mod
+	# r.add_version('/tmp/altered.xml')
+
+	# from pymongo import Connection
+	# connection = Connection('localhost', 27017)
+	# db = connection.pulsearch
+	# voy_records = db.voy_records
+	# voy_records.ensure_index('control_no', unique=True)
+	# voy_records.ensure_index('last_mod')
+
+	# # inserted = voy_records.insert(r.__dict__)
+
+	# # print r.diffs[0][1]
+	# # print r.control_no, r.last_mod
+	# # pp = pprint.PrettyPrinter(indent=4)
+	# # pp.pprint(r.__dict__)
+	# rec = Record()
+	# rec.__dict__ = voy_records.find_one({"control_no": "100180"})
+	# print rec.diffs
+
