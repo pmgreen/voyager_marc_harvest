@@ -1,3 +1,11 @@
+This was hacked together quickly. There's no setup.py nor are there any tests. 
 
+To run:
+ * Clone the code repo
+ * Get the dependencies from PyPi (see below)
+ * `cp conf.ini.tmpl conf.ini` and fill it out
+ * Execute the module (python -m /path/to/primo_harvester)
 
-Requirements: python-dateutil 1.5: pip install python-dateutil==1.5
+Requirements: 
+ * python-dateutil 1.5: pip install python-dateutil==1.5
+ * paramiko: pip install paramiko

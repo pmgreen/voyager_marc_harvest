@@ -7,6 +7,8 @@ harvest.py
 Responsible for getting records from Voyager publishing service, parsing them 
 into real MaRCXML, and loading them into the database.
 
+Errors go to stderr, info to stdout.
+
 Author: <a href="jstroop@princeton.edu">Jon Stroop</a>
 Since: 2013-03-01
 '''
@@ -31,24 +33,38 @@ Since: 2013-03-01
 # similarly for directories.
 #
 
+from __init__ import setup_logging
 from xml.dom.minidom import parseString
+import ConfigParser
 import dateutil.parser
 import difflib
 import os
 import tarfile
 import xml.etree.cElementTree as ET
 
-# TODO: logging.
+# Configuration / Constants
+config = ConfigParser.ConfigParser()
+config.read('./conf.ini')
 
-# Configuration
-ERROR_DIR = '/tmp/voy_harvest_errs'
-TAR_DOWNLOADS = '/home/jstroop/voy_pull'
-
-# Constants
-NO_DIFFERENCE = 'NO_DIFFERENCE'
+ERROR_DIR = config.get('harvester', 'error_dir')
+FINAL_XML_DIR = config.get('harvester', 'final_xml_dir')
 MRX_NS = 'http://www.loc.gov/MARC21/slim'
-ET.register_namespace('', MRX_NS)
+NO_DIFFERENCE = 'NO_DIFFERENCE'
+TAR_DOWNLOADS = config.get('harvester', 'tar_downloads')
 TAR_EXTENSION = 'tar.gz'
+TMP_UNPACK = config.get('harvester', 'tmp_unpack')
+
+
+COLLECTION_START = '<collection xmlns="%s">' % (MRX_NS,)
+COLLECTION_END = '</collection>'
+
+
+# Global setup
+logger = setup_logging(__name__)
+ET.register_namespace('', MRX_NS)
+
+__dps = (ERROR_DIR, TAR_DOWNLOADS, TMP_UNPACK, FINAL_XML_DIR)
+[os.makedirs(d) for d in __dps if not os.path.exists(d)]
 
 class Record(object):
 	'''Internal representation of a MaRCXML record, without Ex Libris' OAI-PMH 
@@ -89,8 +105,33 @@ class Record(object):
 			self.diffs.append((self.last_mod, diff))
 			self.current_version = new_mrx
 
+	def _make_diff(self, prev_xml_str, new_xml_str, prev_date, new_date):
+		diff = None
+		try:
+			if prev_xml_str == new_xml_str:
+				diff = NO_DIFFERENCE
+			else:
+				prev_dom = parseString(prev_xml_str)
+				pretty_prev = prev_dom.toprettyxml(encoding='UTF-8', newl='\n')
+				prev_date_iso = prev_date.isoformat()
+
+				new_dom = parseString(new_xml_str)
+				pretty_new = new_dom.toprettyxml(encoding='UTF-8', newl='\n')
+				new_date_iso = new_date.isoformat()
+
+				diff_gen = difflib.unified_diff(pretty_prev.split('\n'), 
+												pretty_new.split('\n'), 
+												fromfiledate=prev_date_iso,
+												tofiledate=new_date_iso)
+				diff = '\n'.join(diff_gen)
+		
+		except Exception, e:
+			raise e
+		finally:
+			return diff
+
 	# Don't love that this and the next meth both have to parse, but we need to 
-	# do these things extarnal to the class as well.
+	# do these things external to the class as well.
 	@staticmethod
 	def extract_header_vals(exlibris_marcxml_fp):
 		'''Return a 2-ple (id, datestamp).
@@ -120,94 +161,34 @@ class Record(object):
 			return ET.tostring(record_e, encoding='UTF-8').split('?>')[-1].strip()
 			# There must be a better way to strip the PI, but this ^ is it for now.
 
-	def _make_diff(self, prev_xml_str, new_xml_str, prev_date, new_date):
-		diff = None
+	@staticmethod
+	def extract_control_status_mrx(exlibris_marcxml_fp):
+		'''Get a (control number, status, mrx) three-tuple
+		'''
 		try:
-			if prev_xml_str == new_xml_str:
-				diff = NO_DIFFERENCE
-			else:
-				prev_dom = parseString(prev_xml_str)
-				pretty_prev = prev_dom.toprettyxml(encoding='UTF-8', newl='\n')
-				prev_date_iso = prev_date.isoformat()
+			etree = ET.parse(exlibris_marcxml_fp) 
+			root = etree.getroot()
+			header = root.find('./ListRecords/record/header')
 
-				new_dom = parseString(new_xml_str)
-				pretty_new = new_dom.toprettyxml(encoding='UTF-8', newl='\n')
-				new_date_iso = new_date.isoformat()
+			control = header.find('identifier').text
 
-				diff_gen = difflib.unified_diff(pretty_prev.split('\n'), 
-												pretty_new.split('\n'), 
-												fromfiledate=prev_date_iso,
-												tofiledate=new_date_iso)
-				diff = '\n'.join(diff_gen)
-		
+			status_attr = header.attrib.get('status')
+			status = status_attr.text if status_attr else 'create_update'
+
+			record_e = root.find('.//metadata/*')
+
 		except Exception, e:
-			raise e
-		finally:
-			return diff
-		
-def unpack_tarball(tarfile_fp):
-	'''Unpack a tarball to a temporary directory. Return (str) the path to the 
-	directory that was created.
-
-	Raises:
-		Exception, in anything else goes wrong.
-	'''
-	# have to keep files nad dirs sorted by time (name) for later processing
-	fname = os.path.basename(tarfile_fp)[:-len(TAR_EXTENSION)-1]
-	to_dir = '/tmp/voy_harvest%s' % (fname,)
-	os.mkdir(to_dir)
-	try:
-		t = tarfile.open(tarfile_fp, 'r')
-		t.extractall(to_dir)
-	except Exception as e:
-		if to_dir:
-			fps = [os.path.join(to_dir, p) for p in os.listdir(to_dir)]
-			map(os.remove, fps)
-			os.rmdir(to_dir)
-		raise HarvesterException(e, tarfile_fp)
-	else:
-		os.remove(tarfile_fp)
-	finally:
-		t.close()
-		if to_dir:
-			return to_dir
-
-def process_tarball_dir(dp):
-	'''Return a list of paths to directories that contain the contents of 
-	unpacked tar files.
-	'''
-	tar_fns = [n for n in filter(lambda n: n.endswith(TAR_EXTENSION), os.listdir(dp))]
-	tar_fps = [os.path.join(TAR_DOWNLOADS, fn) for fn in tar_fns]
-	unpacked_dps = []
-	for tar_fp in tar_fps:
-		try:
-			dp = unpack_tarball(tar_fp)
-		except HarvesterException as he:
-			pass # init of HarvesterException handles.
-		except Exception as e:
-			raise HarvesterException(e, tar_fp)
+			raise HarvesterException(e, exlibris_marcxml_fp)
 		else:
-			unpacked_dps.append(dp)
-	unpacked_dps.sort()
-	return unpacked_dps		
-
-def process_file_dir(dp):
-	xml_fps = [os.path.join(dp, fn) for fn in os.listdir(dp)]
-	xml_fps.sort()
-	for xml_fp in xml_fps:
-		try:
-			control_no, stamp = Record.extract_header_vals(xml_fp)
-		except HarvesterException as he:
-			pass # init of HarvesterException handles.
-		except Exception as e:
-			raise HarvesterException(e, xml_fp)
-		else:
-			pass # print control_no
+			mrx = ET.tostring(record_e, encoding='UTF-8').split('?>')[-1].strip()
+			mrx = mrx.replace(' xmlns="%s"' % MRX_NS, '')
+			return (control, status, mrx)
 
 class HarvesterException(Exception):
-	'''Raised when we have trouble with any kind of file: tar or XML. Whether
-	it's parsing or missing elements, this class will copy the file at the 
-	specified path (fp) to a holding location for further inspection.
+	'''Raised when we have trouble with any (either) kind of file: tar or XML. 
+	Whether	it's parsing or missing elements, at init this class will copy the 
+	file at the specified path (fp) to a holding location for further (human) 
+	inspection.
 	'''
 	def __init__(self, original_exception, fp):
 		cl_name = original_exception.__class__.__name__
@@ -227,37 +208,94 @@ class HarvesterException(Exception):
 			c+=1
 		shutil.move(fp, new_path)
 
-		#TODO: log
-		bn = os.path.basename(fp)
-		os.sys.stderr.write('%s: (%s) %s\n' % (cl_name, fp, message))
-		os.sys.stderr.write('Could not handle %s. Moved to %s.\n' % (bn, ERROR_DIR))
+		logger.warn('%s: (%s) %s' % (cl_name, fp, message))
+		logger.warn('Could not handle %s. Moved to %s.' % (fp, new_path))
 
-		
+##############
+# Functions
+##############
+
+def unpack_tarball(tarfile_fp):
+	'''Unpack a tarball to a temporary directory. Return (str) the path to the 
+	directory that was created.
+	'''
+	# have to keep files nad dirs sorted by time (name) for later processing
+	fname = os.path.basename(tarfile_fp)[:-len(TAR_EXTENSION)-1]
+	to_dir = os.path.join(TMP_UNPACK, fname)
+	os.mkdir(to_dir)
+	try:
+		t = tarfile.open(tarfile_fp, 'r')
+		t.extractall(to_dir)
+	except Exception as e:
+		if to_dir:
+			fps = [os.path.join(to_dir, p) for p in os.listdir(to_dir)]
+			map(os.remove, fps)
+			os.rmdir(to_dir)
+			logger.warn('Removed %s as a result of follow Exception' % to_dir)
+		raise HarvesterException(e, tarfile_fp)
+	else:
+		logger.debug('Unpacked %s to %s' % (tarfile_fp, to_dir))
+		os.remove(tarfile_fp)
+	finally:
+		t.close()
+		if to_dir:
+			return to_dir
+
+def process_tarball_dir(dp):
+	'''Return a list of paths to directories that contain the contents of 
+	unpacked tar files.
+	'''
+	__filter = lambda n: n.endswith(TAR_EXTENSION)
+	tar_fns = [n for n in filter(__filter, os.listdir(dp))]
+	tar_fps = [os.path.join(TAR_DOWNLOADS, fn) for fn in tar_fns]
+	unpacked_dps = []
+	for tar_fp in tar_fps:
+		try:
+			unpacked_dp = unpack_tarball(tar_fp)
+		except HarvesterException as he:
+			pass # init of HarvesterException handles.
+		except Exception as e:
+			raise HarvesterException(e, tar_fp)
+			continue
+		else:
+			unpacked_dps.append(unpacked_dp)
+	unpacked_dps.sort()
+	return unpacked_dps		
+
+def process_file_dir(dp):
+	'''Go through a dir of XML files and get the MaRCXML.
+	'''
+	xml_fps = [os.path.join(dp, fn) for fn in os.listdir(dp)]
+	xml_fps.sort()
+
+	if len(xml_fps) > 0:
+		bn = os.path.basename(dp) + '.mrx'
+		out_fp = os.path.join(FINAL_XML_DIR, bn)
+		with open(out_fp, 'wb') as f:
+			f.write(COLLECTION_START)
+			for xml_fp in xml_fps:
+				try:
+					# control_no, stamp = Record.extract_header_vals(xml_fp)
+					control, status, mrx = Record.extract_control_status_mrx(xml_fp)
+				except HarvesterException as he:
+					pass # init of HarvesterException handles.
+				except Exception as e:
+					raise HarvesterException(e, xml_fp)
+					continue
+				else:
+					# f.write(mrx)
+					if status != 'create_update': 
+						logger.info('%s: %s' % (control, status))
+					logger.debug('Wrote %s to %s' % (control, out_fp))
+					os.remove(xml_fp)
+
+			f.write(COLLECTION_END)
+
+	os.rmdir(dp)
+
 if __name__ == '__main__':
-
 	dps = process_tarball_dir(TAR_DOWNLOADS)
 	for dp in dps:
 		process_file_dir(dp)
 
-	# # xml_dp = unpack_tarball('/home/jstroop/workspace/voy_pull/primo.20130228100648.0.tar.gz')
-	# r = Record()
-	# r.add_version('/tmp/voy_harvest4paRlx/primo.export.130228100002.100180.0.xml')
-	# r.add_version('/tmp/altered.xml')
-
-	# from pymongo import Connection
-	# connection = Connection('localhost', 27017)
-	# db = connection.pulsearch
-	# voy_records = db.voy_records
-	# voy_records.ensure_index('control_no', unique=True)
-	# voy_records.ensure_index('last_mod')
-
-	# # inserted = voy_records.insert(r.__dict__)
-
-	# # print r.diffs[0][1]
-	# # print r.control_no, r.last_mod
-	# # pp = pprint.PrettyPrinter(indent=4)
-	# # pp.pprint(r.__dict__)
-	# rec = Record()
-	# rec.__dict__ = voy_records.find_one({"control_no": "100180"})
-	# print rec.diffs
 
