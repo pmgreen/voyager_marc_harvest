@@ -38,8 +38,8 @@ class StdErrFilter(logging.Filter):
 class StdOutFilter(logging.Filter):
 	def filter(self,record):
 		# To show DEBUG
-		return 1 if record.levelno <= 20 else 0
-		# return 1 if record.levelno <= 20 and record.levelno > 1
+		# return 1 if record.levelno <= 20 else 0
+		return 1 if record.levelno <= 20 and record.levelno > 1
 
 # Configuration / Constants
 config = ConfigParser.ConfigParser()
