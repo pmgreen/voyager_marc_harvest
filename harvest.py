@@ -3,27 +3,14 @@
 '''
 harvest.py
 ==========
-
-Responsible for getting records from Voyager publishing service, parsing them 
-into real MaRCXML, and loading them into the database.
+Getting records from Voyager publishing service, parse them into real MaRCXML 
+and save to a directory as MaRC collections for further processing.
 
 Errors go to stderr, info to stdout.
 
 Author: <a href="jstroop@princeton.edu">Jon Stroop</a>
 Since: 2013-03-01
 '''
-#
-# Flow
-# ----
-# 1. Build a string that matches the Voyger publishing naming conventions 
-#	 (awesome!)
-# 2. Connect to SFTP server
-# 3. SCP tar.gz files to local machine
-# 4. Disconnect from SFTP server
-# 5. Unpack each tar.gz file
-# 6. For each XML file in each tar.gz file, parse out the XML and metadata; 
-#    either into an object TBD (probably) or directly to the database.
-# 7. Load/update the object in the database. 
 #
 # Naming Convention Note
 # ----------------------
@@ -33,38 +20,73 @@ Since: 2013-03-01
 # similarly for directories.
 #
 
-from __init__ import setup_logging
 from xml.dom.minidom import parseString
 import ConfigParser
 import dateutil.parser
 import difflib
+import logging
 import os
+import paramiko
+import sys
 import tarfile
 import xml.etree.cElementTree as ET
 
+class StdErrFilter(logging.Filter):
+	def filter(self,record):
+		return 1 if record.levelno >= 30 else 0
+
+class StdOutFilter(logging.Filter):
+	def filter(self,record):
+		# To show DEBUG
+		return 1 if record.levelno <= 20 else 0
+		# return 1 if record.levelno <= 20 and record.levelno > 1
+
 # Configuration / Constants
 config = ConfigParser.ConfigParser()
-config.read('./conf.ini')
+conf_fp = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'conf.ini')
+config.read(os.path.join(conf_fp))
 
+COLLECTION_END = '</collection>'
+COLLECTION_START = '<collection xmlns="http://www.loc.gov/MARC21/slim">'
+CREATE_UPDATE = 'CREATE_UPDATE'
+DELETED='deleted'
+DELETE_IDS_FP = config.get('harvester', 'deletes_file')
 ERROR_DIR = config.get('harvester', 'error_dir')
 FINAL_XML_DIR = config.get('harvester', 'final_xml_dir')
+LOG_FMT = '%(asctime)s (%(name)s) [%(levelname)s]: %(message)s'
 MRX_NS = 'http://www.loc.gov/MARC21/slim'
 NO_DIFFERENCE = 'NO_DIFFERENCE'
+SSH_CHANGED_SINCE_FILE = config.get('ssh', 'changed_since_file')
+SSH_FIND_UTIL = config.get('ssh', 'find_util')
+SSH_PW = config.get('ssh', 'pw')
+SSH_SERVER = config.get('ssh', 'server')
+SSH_SERVER_DIR = config.get('ssh', 'server_dir')
+SSH_USER = config.get('ssh', 'user')
 TAR_DOWNLOADS = config.get('harvester', 'tar_downloads')
 TAR_EXTENSION = 'tar.gz'
 TMP_UNPACK = config.get('harvester', 'tmp_unpack')
 
+# Set up logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
-COLLECTION_START = '<collection xmlns="%s">' % (MRX_NS,)
-COLLECTION_END = '</collection>'
+formatter = logging.Formatter(fmt=LOG_FMT)
 
+err_handler = logging.StreamHandler(sys.__stderr__)
+err_handler.addFilter(StdErrFilter())
+err_handler.setFormatter(formatter)
+logger.addHandler(err_handler)
 
-# Global setup
-logger = setup_logging(__name__)
-ET.register_namespace('', MRX_NS)
+out_handler = logging.StreamHandler(sys.__stdout__)
+out_handler.addFilter(StdOutFilter())
+out_handler.setFormatter(formatter)
+logger.addHandler(out_handler)
 
+# Make dirs
 __dps = (ERROR_DIR, TAR_DOWNLOADS, TMP_UNPACK, FINAL_XML_DIR)
 [os.makedirs(d) for d in __dps if not os.path.exists(d)]
+
+ET.register_namespace('', MRX_NS)
 
 class Record(object):
 	'''Internal representation of a MaRCXML record, without Ex Libris' OAI-PMH 
@@ -173,7 +195,7 @@ class Record(object):
 			control = header.find('identifier').text
 
 			status_attr = header.attrib.get('status')
-			status = status_attr.text if status_attr else 'create_update'
+			status = status_attr if status_attr else CREATE_UPDATE
 
 			record_e = root.find('.//metadata/*')
 
@@ -241,12 +263,12 @@ def unpack_tarball(tarfile_fp):
 		if to_dir:
 			return to_dir
 
-def process_tarball_dir(dp):
+def process_tarball_dir():
 	'''Return a list of paths to directories that contain the contents of 
 	unpacked tar files.
 	'''
 	__filter = lambda n: n.endswith(TAR_EXTENSION)
-	tar_fns = [n for n in filter(__filter, os.listdir(dp))]
+	tar_fns = [n for n in filter(__filter, os.listdir(TAR_DOWNLOADS))]
 	tar_fps = [os.path.join(TAR_DOWNLOADS, fn) for fn in tar_fns]
 	unpacked_dps = []
 	for tar_fp in tar_fps:
@@ -271,6 +293,7 @@ def process_file_dir(dp):
 	if len(xml_fps) > 0:
 		bn = os.path.basename(dp) + '.mrx'
 		out_fp = os.path.join(FINAL_XML_DIR, bn)
+
 		with open(out_fp, 'wb') as f:
 			f.write(COLLECTION_START)
 			for xml_fp in xml_fps:
@@ -283,9 +306,12 @@ def process_file_dir(dp):
 					raise HarvesterException(e, xml_fp)
 					continue
 				else:
-					# f.write(mrx)
-					if status != 'create_update': 
+					if status == DELETED: 
 						logger.info('%s: %s' % (control, status))
+						with open(DELETE_IDS_FP, 'ab') as df:
+							df.write(control + os.linesep)
+					else:
+						f.write(mrx)
 					logger.debug('Wrote %s to %s' % (control, out_fp))
 					os.remove(xml_fp)
 
@@ -293,9 +319,44 @@ def process_file_dir(dp):
 
 	os.rmdir(dp)
 
+def harvest():
+	try:
+		ssh_client = paramiko.SSHClient()
+		ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+		ssh_client.connect(SSH_SERVER, username=SSH_USER, password=SSH_PW)
+		cmd = '%s %s -newer %s' % (SSH_FIND_UTIL, SSH_SERVER_DIR, SSH_CHANGED_SINCE_FILE)
+		stdin, stdout, stderr = ssh_client.exec_command(cmd)
+		remote_paths = map(str.strip, stdout.readlines())
+		remote_paths.remove(SSH_SERVER_DIR)
+		sftp_client = ssh_client.open_sftp()
+		for remote_path in remote_paths:
+			bn = os.path.basename(remote_path)
+			local_path = os.path.join(TAR_DOWNLOADS, bn)
+			logger.debug('Getting %s' % remote_path)
+			try:
+				sftp_client.get(remote_path, local_path)
+			except Exception, e:
+				logger.critical('%s: %s' % (e.__class__.__name__, str(e)))
+				continue
+	except Exception, e:
+		logger.critical('%s: %s' % (e.__class__.__name__, str(e)))
+	finally:
+		if ssh_client:
+			ssh_client.close()
+		if sftp_client:
+			sftp_client.close()
+	return True
+
 if __name__ == '__main__':
-	dps = process_tarball_dir(TAR_DOWNLOADS)
-	for dp in dps:
-		process_file_dir(dp)
+	if harvest(): 
+		map(process_file_dir, process_tarball_dir())
+
+## Longhand:
+
+# harvest_ok = harvest()
+# if harvest_ok:
+# 	dps = process_tarball_dir()
+# 	for dp in dps:
+# 	 	process_file_dir(dp)
 
 

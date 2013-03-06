@@ -1,0 +1,36 @@
+# All directories must be absolute paths and readable/writable by whoever 
+# runs the script.
+
+[harvester]
+# Absolute path to where to stash problem files for later review
+error_dir = 
+
+# Absolute path to download and then read and files tar files
+tar_downloads = 
+
+# Absolute path to temporary dir for unpacked tar files
+tmp_unpack = 
+
+# Absolute path to final XML files
+final_xml_dir = 
+
+# Absolute path to a file where we'll list control nos of recrords to delete
+deletes_file =
+
+[ssh]
+server = 
+user = 
+pw = 
+server_dir = 
+changed_since_file =
+find_util = 
+
+# Above, e.g.:
+
+```
+$ ssh $user@$server 
+[you'd key in $pw]
+$ $find_util $server_dir -newer $changed_since_file
+```
+
+Should list absolute paths to all new tar files.
