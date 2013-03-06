@@ -6,6 +6,7 @@ To run:
  * Clone the code repo
  * Get the dependencies from PyPi (see below)
  * `cp conf.ini.tmpl conf.ini` and fill it out
+ * Adjust `StdOutFilter` in `harvest.py` if you want debugging output (see comment)
  * Execute `harvest.py`
 
 Requirements: 
